@@ -1,160 +1,250 @@
 # GTEx tissue-aware variant classification with AlphaGenome
 
-本项目使用 AlphaGenome 的组织相关多模态变异效应分数，对 GTEx 精细定位变异进行二分类。项目包含数据审计、固定染色体划分、特征构建、六类模型训练、独立测试、TSS 距离分层评估，以及从 REF/ALT 序列重新计算 11 种 AlphaGenome 分数的代码。
+本仓库整理了两个相互衔接的分析任务：
 
-分类单位是 `variant–target gene–target tissue/context`，而不是去重后的物理 variant。
+1. 使用 AlphaGenome 的 11 种模态分数，对 GTEx 变异进行二分类；
+2. 为同一 tissue 中的 variant pairs 计算非加性交互分数，并使用训练好的 GTEx 分类器进行预测和 FDR 检验。
 
-## 1. 样本定义
+仓库主要保存代码和 Notebook。输入数据、AlphaGenome 模型权重、参考基因组以及正式运行结果需要单独准备。
 
-- 正样本：GTEx association，`PIP > 0.9`；
-- GTEx 负样本：GTEx association，`PIP < 0.01`；
-- Control 负样本：上游数据中冻结的 annotation/location-matched control。
-
-Control 没有真实 target gene 和实测 tissue。其 `target_tissue` 只代表 AlphaGenome 评分上下文，不能解释成实验测量组织。样本来源字段仅用于审计，禁止作为分类特征。
-
-## 2. 数据规模
-
-| 文件 | Context 数 | 唯一物理 variant | 含义 |
-|---|---:|---:|---|
-| `data/positive_gtex_pip_gt_0p9_scored_11modal.parquet` | 42,719 | 14,533 | GTEx `PIP > 0.9` |
-| `data/negative_gtex_pip_lt_0p01_plus_control_scored_11modal.parquet` | 54,518 | 50,722 | GTEx `PIP < 0.01` 与 matched control |
-| `data/unified_binary_dataset.parquet` | 97,237 | 65,084 | 标准化统一主表 |
-| `data/selected_samples.parquet` | 92,895 | 61,574 | 正式训练和评估样本 |
-
-负样本包括 16,430 条 GTEx 低 PIP context 和 38,088 条 matched control context。统一数据覆盖 49 个标准化 GTEx tissue。
-
-审计结果显示：正负样本之间没有重复 `sample_id`，没有物理 variant 跨越数据 split，坐标重建与冻结的 `variant_key` 一致。171 个物理 variant 在不同 gene/tissue context 中具有不同标签，因此保留为 context-specific association。
-
-## 3. AlphaGenome 评分
-
-每个物理 variant 使用以变异为中心的 16,384 bp REF 和 ALT 序列进行预测。一个物理 variant 只进行一次前向计算，再按照 target tissue 和 target gene 把官方 scorer 输出归约到各 association context。
-
-11 种模态为：
+## Repository structure
 
 ```text
-ATAC, DNASE, CHIP_TF, CHIP_HISTONE, CAGE, PROCAP,
-RNA_SEQ, CONTACT_MAPS, SPLICE_SITES,
-SPLICE_SITE_USAGE, SPLICE_JUNCTIONS
+.
+├── notebooks/
+│   ├── 01_data_audit_and_selection.ipynb
+│   └── 02_train_classifiers.ipynb
+├── ag_scoring/
+│   ├── README.md
+│   ├── score_gtex_11modal.py
+│   ├── score_cell_lines.py
+│   ├── tissue_track_matching.py
+│   ├── merge_gtex_11modal_scores.py
+│   └── run_dual_gpu.sh
+└── variant_pairs_classifier/
+    ├── README.md
+    ├── score_pair_tissue_11modal.py
+    ├── merge_classify_fdr.py
+    └── run_full_dual_gpu_pipeline.sh
 ```
 
-ATAC、DNASE、CHIP_TF、CAGE 和 PROCAP 使用官方 501 bp CenterMask；CHIP_HISTONE 使用 2,001 bp CenterMask；RNA_SEQ 使用 GeneMask LFC；contact 和 splice 模态保留官方 scorer。
+## `notebooks/`
 
-RNA_SEQ 要求精确匹配 GTEx tissue，并在存在准确 target gene 时保留该 gene。其他组织相关模态按“精确 tissue、相同器官系统、相同细胞谱系、通用 track、全局回退”的顺序匹配。匹配规则、winning track、winning gene 和候选数量只用于审计。
+该目录包含 GTEx 二分类任务的数据整理、模型训练和独立测试流程。两个 Notebook 均为自包含文件，主要代码直接写在代码单元中。
 
-## 4. 固定染色体划分
+### `01_data_audit_and_selection.ipynb`
 
-项目不使用随机行划分。
+用于数据审计、标准化和样本选择，主要完成：
+
+- 读取 GTEx 高 PIP 正样本、低 PIP 负样本和 matched control；
+- 统一 variant、target gene、target tissue 和标签字段；
+- 检查重复 `sample_id`、冲突 `variant_key` 和跨 split 泄漏；
+- 按固定染色体划分 Train、Valid 和 Test；
+- Train 和 Test 保留原始样本组成；
+- Valid 在每条染色体内部进行正负样本平衡；
+- 统计每个 split、染色体、tissue 和模态的样本数与覆盖率；
+- 保存后续模型训练使用的统一样本表和审计表。
+
+固定染色体划分为：
 
 - Train：chr1、chr4、chr7、chr8、chr10、chr13、chr15；
 - Valid：chr2、chr5、chr11、chr14、chr17、chr20、chr22、chrX；
 - Test：chr3、chr6、chr9、chr12、chr16、chr18、chr19、chr21。
 
-| Split | Positive | Negative | Total | Negative/Positive |
-|---|---:|---:|---:|---:|
-| Train | 13,086 | 19,433 | 32,519 | 1.4850 |
-| Valid | 13,520 | 13,520 | 27,040 | 1.0000 |
-| Test | 15,551 | 17,785 | 33,336 | 1.1437 |
+### `02_train_classifiers.ipynb`
 
-Train 和 Test 保留冻结染色体中的全部样本。Valid 在每条染色体内部保持 1:1。模型对全量 Test 各预测一次；在模型和阈值锁定后，代码还会构造穷尽式 1:1 Test 评估轮次，不重新训练或选择阈值。
+用于构建特征、训练分类器和评估独立 Test，主要完成：
 
-## 5. 特征配置
+- 构建 `score11`、`score33` 和 `score33_plus_tissue` 三种特征；
+- 仅使用 Train 拟合缺失值插补、标准化和 tissue one-hot 类别；
+- 训练 Logistic Regression、Random Forest、Extra Trees、XGBoost、LightGBM 和 DeepMLP；
+- 使用 Valid 选择主模型并锁定分类阈值；
+- 在模型和阈值锁定后评估完整 Test；
+- 构造穷尽式 1:1 Test 评估轮次；
+- 按 `ALL`、`0-3kb`、`3-12kb`、`12-35kb` 和 `>35kb` 进行 TSS 距离分层；
+- 保存模型、预测概率、评价指标、混淆矩阵、ROC 和 PR 图。
 
-- `score11`：11 个 signed score；
-- `score33`：11 个 signed score、11 个 absolute score、11 个 missing indicator；
-- `score33_plus_tissue`：`score33` 加 Train-fitted GTEx tissue one-hot。
+Test 不参与模型选择、调参或阈值确定。
 
-主分析使用 `score33_plus_tissue`。缺失值插补、标准化、tissue 类别集合和 one-hot 列顺序只在 Train 上拟合。Valid/Test 中未在 Train 出现的 tissue 编码为全 0。
+## `ag_scoring/`
 
-禁止作为特征的字段包括 label、样本来源、PIP、Beta、SE、credible-set 统计量、variant 坐标、chromosome、split、`variant_key`、`sample_id`、target gene、匹配规则、track 名称及负样本构建信息。
+该目录用于从单个 variant 的 REF/ALT 序列重新计算 tissue-aware AlphaGenome 11 模态分数。
 
-## 6. 模型与评估
-
-项目实现 Logistic Regression、Random Forest、Extra Trees、XGBoost、LightGBM 和 PyTorch DeepMLP。
-
-所有模型只在 Train 上训练。Valid 用于选择主模型并通过 Youden J 锁定阈值。只有 `selection_lock_before_test.json` 保存后才运行 Test。Test 不参与模型选择、调参和阈值选择。
-
-评价指标包括 AUROC、AUPRC、Balanced Accuracy、F1、Sensitivity、Specificity、混淆矩阵、ROC/PR 曲线，以及按 `variant_key` 聚类的 AUROC bootstrap 95% 置信区间。
-
-## 7. 正式结果
-
-主实验使用 `score33_plus_tissue`。Valid 结果为：
-
-| Model | AUROC | AUPRC | Balanced Accuracy |
-|---|---:|---:|---:|
-| Extra Trees | 0.8931 | 0.8941 | 0.8255 |
-| DeepMLP | 0.8914 | 0.8923 | 0.8224 |
-| XGBoost | 0.8893 | 0.8922 | 0.8229 |
-| LightGBM | 0.8864 | 0.8888 | 0.8192 |
-| Logistic Regression | 0.8843 | 0.8850 | 0.8200 |
-| Random Forest | 0.8522 | 0.8603 | 0.8024 |
-
-Valid 选择 Extra Trees，并锁定阈值 0.4467。在全部 33,336 条 Test context 上：
-
-| AUROC | AUROC 95% CI | AUPRC | Balanced Accuracy | F1 | Sensitivity | Specificity |
-|---:|---:|---:|---:|---:|---:|---:|
-| 0.8909 | 0.8837–0.8979 | 0.8758 | 0.8235 | 0.8135 | 0.8264 | 0.8205 |
-
-置信区间来自 2,000 次 `variant_key` cluster bootstrap。Test 结果只报告 Valid 预先选定的主模型。
-
-## 8. TSS 分层
-
-目标基因 TSS 使用 hg38 GENCODE v46 和标准化 Ensembl gene ID 精确映射，距离为 `abs(variant_position - target_gene_tss)`。TSS 仅用于评估，不进入模型。
-
-Test 结果分为 `ALL`、`0-3kb`、`3-12kb`、`12-35kb` 和 `>35kb`。Control 没有真实 target gene，因此只进入 `ALL`。
-
-## 9. 项目结构
+输入序列长度为 16,384 bp。计算的模态包括：
 
 ```text
-GTEx_self/
-├── data/
-├── notebooks/
-│   ├── 01_data_audit_and_selection.ipynb
-│   └── 02_train_classifiers.ipynb
-├── ag_scoring/
-│   ├── score_gtex_11modal.py
-│   ├── tissue_track_matching.py
-│   ├── merge_gtex_11modal_scores.py
-│   └── run_dual_gpu.sh
-├── variant_pairs_classifier/
-└── results/
+ATAC
+DNASE
+CHIP_TF
+CHIP_HISTONE
+CAGE
+PROCAP
+RNA_SEQ
+CONTACT_MAPS
+SPLICE_SITES
+SPLICE_SITE_USAGE
+SPLICE_JUNCTIONS
 ```
 
-大型数据、模型 checkpoint 和参考基因组文件是否随仓库发布，应根据数据使用协议和文件大小单独决定。
+### `score_gtex_11modal.py`
 
-## 10. 运行
+单变异 11 模态评分的主程序，负责：
 
-分类部分需要 pandas、NumPy、PyArrow、SciPy、scikit-learn、XGBoost、LightGBM、PyTorch、Matplotlib、Seaborn 和 Jupyter。
+- 按物理 `variant_key` 去重；
+- 构建 16,384 bp REF/ALT 输入；
+- 一次前向预测多个 AlphaGenome 输出；
+- 按 target gene 和 target tissue 规约官方 scorer 输出；
+- 保存每个 context 的 signed score；
+- 保存匹配规则、winning track、winning gene 和候选数量；
+- 使用稳定分区支持多 worker 并行；
+- 使用原子 Parquet shard 支持断点续跑；
+- 在显存不足时自动降低 batch size。
 
-1. 打开 `notebooks/01_data_audit_and_selection.ipynb`，在首个配置单元设置项目和输入数据的相对或本地路径，完成审计与选样。
-2. 打开 `notebooks/02_train_classifiers.ipynb`，先用 `FAST_MODE=True` 检查流程，再设置唯一 `RUN_TAG` 并用 `FAST_MODE=False` 运行正式实验。
-3. 每次运行的模型、预测、指标和图像保存在 `results/<RUN_TAG>/`。
+一个物理 variant 只进行一次模型前向计算，但同一 variant 对应的不同 gene/tissue context 会分别保存分数。
 
-AlphaGenome 重新评分还需要官方 AlphaGenome/JAX 依赖、hg38 FASTA、GENCODE 注释、模型 checkpoint 和官方参考资源。准备 `data/ag_scoring_input_16kb.parquet` 后，可先检查输入：
+### `score_cell_lines.py`
 
-```bash
-python ag_scoring/score_gtex_11modal.py --dataset data/ag_scoring_input_16kb.parquet --output-dir results/ag_scoring/example_run --validate-only
+底层模型和批处理工具，提供：
+
+- variant 坐标解析与 REF/ALT 序列构建；
+- AlphaGenome checkpoint、hg38 FASTA 和参考注释加载；
+- 单 variant 与批量 variant 前向预测；
+- track 分组和分数规约；
+- shard 写入与 resume 辅助功能。
+
+`score_gtex_11modal.py` 会复用该文件中的模型加载和批量输入函数。该文件也保留了独立的 cell-line 评分入口。
+
+### `tissue_track_matching.py`
+
+负责把 GTEx tissue 与 AlphaGenome 输出 track 对齐。
+
+RNA-seq 要求精确匹配 GTEx tissue。其他组织相关模态按照以下顺序逐级匹配：
+
+1. 精确 GTEx tissue；
+2. 相同器官系统；
+3. 相同细胞谱系；
+4. 通用细胞模型；
+5. 全局非 padding track。
+
+每次匹配都会返回明确的 `match_rule`，便于在下游分析中区分精确匹配和模糊回退。
+
+### `merge_gtex_11modal_scores.py`
+
+负责合并评分 shard 并进行质量检查，主要包括：
+
+- 检查输入样本是否完整覆盖；
+- 检查重复或额外 `sample_id`；
+- 比较输入与评分结果的 variant、label、tissue、gene 和 split；
+- 合并 11 模态分数；
+- 统计逐模态和逐样本来源覆盖率；
+- 统计 tissue-track 匹配规则；
+- 导出仍未匹配的 context 和 scorer 错误；
+- 生成最终评分主表和 JSON 汇总。
+
+### `run_dual_gpu.sh`
+
+多 GPU 运行入口，负责：
+
+- 检查输入文件和运行环境；
+- 在正式评分前执行 `validate-only`；
+- 将物理 variant 稳定分配给两个 worker；
+- 分别保存每个 worker 的日志和 PID；
+- 等待所有 worker 完成；
+- 自动调用合并和覆盖率检查程序。
+
+硬件编号、batch size、输入目录和输出目录应根据实际运行环境配置。
+
+## `variant_pairs_classifier/`
+
+该目录用于计算同一 tissue 下 variant pairs 的 11 模态非加性交互值，并使用冻结的 GTEx 分类器进行预测和显著性检验。
+
+每个 pair 构建四种序列状态：
+
+```text
+REFREF
+ALTREF
+REFALT
+ALTALT
 ```
 
-正式评分前，请在评分配置中设置模型和参考资源路径。评分程序支持稳定分区、批处理、原子 Parquet shard、自动断点续跑和显存不足时自动降低 batch size。
+非加性交互值定义为：
 
-## 11. 主要输出
+```text
+interaction = score(ALTALT vs REFREF)
+            - score(ALTREF vs REFREF)
+            - score(REFALT vs REFREF)
+```
 
-- `validation_metrics.csv`；
-- `selection_lock_before_test.json`；
-- `feature_schema.json`；
-- `test_all_metrics.csv`；
-- `test_predictions.parquet`；
-- `test_round_metrics.csv`；
-- `test_tss_bin_metrics.csv`；
-- `test_confusion_matrix.csv`；
-- `test_roc.png` 和 `test_pr.png`；
-- `models/`；
-- `experiment_summary.json`。
+### `score_pair_tissue_11modal.py`
 
-## 12. 数据与参考资源
+variant-pairs AlphaGenome 评分主程序，负责：
 
-- GTEx Portal：https://gtexportal.org/
-- GENCODE human release 46：https://www.gencodegenes.org/human/release_46.html
-- AlphaGenome：请遵守模型官方仓库、论文和模型资源页面中的许可要求。
+- 为每个物理 pair 构建四种单倍型组合；
+- 对 11 种模态分别调用官方 scorer；
+- 对 CenterMask 模态使用以 pair 中点为中心的扩展 mask；
+- 在存在 gene 信息时先进行 pair gene 匹配；
+- 再根据 `target_tissue` 进行 tissue-track 匹配；
+- 仅在同一个 `pair × tissue × modality` 内选择最大绝对值的 signed interaction；
+- 不跨 tissue 或模态进行 `idxmax`；
+- 同时保存聚合分数和全部匹配 track 明细；
+- 支持稳定分区、Parquet shard 和断点续跑。
 
-使用本项目时，请同时引用 GTEx、GENCODE、AlphaGenome 及所采用机器学习库的原始论文或官方资源。
+### `merge_classify_fdr.py`
+
+负责将 pair 分数转换成冻结 GTEx 分类器的输入，并进行概率预测和 FDR 分析：
+
+- 合并所有 pair 聚合 shard 和 track-detail shard；
+- 检查每个 pair 是否完整包含 11 种模态；
+- 构建 11 个 signed、11 个 absolute、11 个 missing indicator；
+- 按 Train 冻结顺序构建 tissue one-hot；
+- 加载 Valid 阶段锁定的分类器和分类阈值；
+- 保存每个 `pair × tissue` 的正类概率；
+- 分别使用低 PIP、control 以及二者合并作为 null distribution；
+- 计算右尾经验 p-value；
+- 使用 Benjamini–Hochberg 方法进行 multiple-testing correction；
+- 保存 FDR 显著的 variant pairs、统计表和密度图。
+
+分类器概率表示 pair 的 11 模态非加性交互模式与 GTEx 因果正样本的相似程度，不能直接解释为生物学 PIP。
+
+### `run_full_dual_gpu_pipeline.sh`
+
+variant-pairs 完整流水线入口，执行顺序为：
+
+1. 启动多个评分 worker；
+2. 等待全部 11 模态评分完成；
+3. 合并评分和 track 明细；
+4. 重建冻结分类器特征；
+5. 生成分类概率；
+6. 计算三种 null definition 下的经验 p-value 和 BH-FDR；
+7. 保存日志、显著 pair 表格和密度图。
+
+## Suggested workflow
+
+如果已经具有完整的单变异 11 模态分数，可以从 Notebook 开始：
+
+1. 运行 `notebooks/01_data_audit_and_selection.ipynb`；
+2. 运行 `notebooks/02_train_classifiers.ipynb`；
+3. 使用 Valid 选择并锁定正式分类器；
+4. 运行 `variant_pairs_classifier/` 中的 pair 评分和 FDR 流程。
+
+如果需要从 REF/ALT 序列重新生成单变异分数，则先运行 `ag_scoring/`，再执行两个 Notebook。
+
+## External resources
+
+本仓库不包含以下大型或受许可约束的资源：
+
+- GTEx 和 matched-control 输入数据；
+- variant-pairs 输入表；
+- AlphaGenome 模型 checkpoint；
+- hg38 FASTA；
+- GENCODE 和其他 AlphaGenome 参考注释；
+- 正式训练模型与运行结果。
+
+运行前需要在 Notebook 配置单元和脚本配置项中设置这些资源的实际位置。
+
+## Notes
+
+- 不要把 PIP、样本来源、variant 坐标、split、匹配规则或 track 名称作为分类特征；
+- tissue one-hot 的类别和顺序只能在 Train 上拟合；
+- Valid 用于模型和阈值选择，Test 仅用于最终评估；
+- 所有正式实验应使用独立的输出目录或 `RUN_TAG`，避免覆盖已有结果。
