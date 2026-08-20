@@ -217,34 +217,3 @@ variant-pairs 完整流水线入口，执行顺序为：
 5. 生成分类概率；
 6. 计算三种 null definition 下的经验 p-value 和 BH-FDR；
 7. 保存日志、显著 pair 表格和密度图。
-
-## Suggested workflow
-
-如果已经具有完整的单变异 11 模态分数，可以从 Notebook 开始：
-
-1. 运行 `notebooks/01_data_audit_and_selection.ipynb`；
-2. 运行 `notebooks/02_train_classifiers.ipynb`；
-3. 使用 Valid 选择并锁定正式分类器；
-4. 运行 `variant_pairs_classifier/` 中的 pair 评分和 FDR 流程。
-
-如果需要从 REF/ALT 序列重新生成单变异分数，则先运行 `ag_scoring/`，再执行两个 Notebook。
-
-## External resources
-
-本仓库不包含以下大型或受许可约束的资源：
-
-- GTEx 和 matched-control 输入数据；
-- variant-pairs 输入表；
-- AlphaGenome 模型 checkpoint；
-- hg38 FASTA；
-- GENCODE 和其他 AlphaGenome 参考注释；
-- 正式训练模型与运行结果。
-
-运行前需要在 Notebook 配置单元和脚本配置项中设置这些资源的实际位置。
-
-## Notes
-
-- 不要把 PIP、样本来源、variant 坐标、split、匹配规则或 track 名称作为分类特征；
-- tissue one-hot 的类别和顺序只能在 Train 上拟合；
-- Valid 用于模型和阈值选择，Test 仅用于最终评估；
-- 所有正式实验应使用独立的输出目录或 `RUN_TAG`，避免覆盖已有结果。
